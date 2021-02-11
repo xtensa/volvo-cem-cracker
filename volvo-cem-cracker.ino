@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0 */
-/*
+/* 
  * Copyright (C) 2020 Vitaly Mayatskikh <v.mayatskih@gmail.com>
  *                    Christian Molson <christian@cmolabs.org>
  *                    Mark Dapoz <md@dapoz.ca>
