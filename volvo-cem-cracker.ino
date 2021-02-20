@@ -1266,6 +1266,7 @@ void setup (void)
 
   pinMode (CAN_L_PIN, INPUT_PULLUP);
   pinMode(PLATFORM_SELECTION_PIN, INPUT_PULLUP);
+  delay(100);
   if (digitalRead(PLATFORM_SELECTION_PIN) == HIGH)
   {
     platform = PLATFORM_P1;
