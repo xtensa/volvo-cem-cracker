@@ -67,6 +67,7 @@
  *
  */
 
+
 /* hardware selection */
 
 #define MCP2515_HW      1   /* Teensy with external CAN controllers */
@@ -98,6 +99,11 @@ uint8_t platform;
 #elif (HW_SELECTION == TEENSY_CAN_HW)
  #include <FlexCAN_T4.h>
 
+#else
+ #error Hardware platform must be selected.
+#endif
+
+
  #if defined(__IMXRT1062__)
   #define TEENSY_MODEL_4X
  #elif defined(__MK66FX1M0__)
@@ -110,9 +116,6 @@ uint8_t platform;
   #error Unsupported Teensy model.
  #endif
 
-#else
- #error Hardware platform must be selected.
-#endif
 
 uint8_t BUCKETS_PER_US;                     /* how many buckets per microsecond do we store (1 means 1us resolution */
 uint8_t CEM_REPLY_DELAY_US;                 /* minimum time in us for CEM to reply for PIN unlock command (approx) */
@@ -355,19 +358,23 @@ bool canMsgReceive (uint32_t *id, uint8_t *data, bool wait, bool verbose)
   uint8_t msg[CAN_MSG_SIZE] = { 0 };
 
   do {
-    uint8_t len;
+    uint8_t len, rcvStat;
 
     /* poll if a message is available */
 
-    ret = (CAN_HS.checkReceive () == CAN_MSGAVAIL);
+    rcvStat = CAN_HS.checkReceive ();
+    //printf("Read status: %d\n", rcvStat);
+    ret = (rcvStat == CAN_MSGAVAIL);
     if (ret == true) {
-
+    
       /* retrieve available message and return it */
 
       CAN_HS.readMsgBuf (&len, msg);
       canId = CAN_HS.getCanId ();
       pData = msg;
     }
+    //else printf ("wait\n");
+
   } while ((ret == false) && (wait == true));
 
 #elif (HW_SELECTION == TEENSY_CAN_HW)
@@ -512,6 +519,7 @@ void canInterruptHandler (void)
   /* we're only interested if the interrupt was received */
 
   canInterruptReceived = true;
+  //printf("Interrupt received\n");
 }
 
 /*******************************************************************************
@@ -660,7 +668,8 @@ bool cemUnlock (uint8_t *pin, uint8_t *pinUsed, uint32_t *latency, bool verbose)
 void ecuPrintPartNumber (uint8_t ecuId)
 {
   uint32_t id;
-  uint8_t  data[CAN_MSG_SIZE] = { 0xff, 0x88, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+  //uint8_t  data[CAN_MSG_SIZE] = { 0xff, 0x88, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+  uint8_t  data[CAN_MSG_SIZE] = { ecuId, 0x88, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
   bool     verbose = true;
 
   printf ("Reading part number from ECU 0x%02x\n", ecuId);
@@ -694,7 +703,7 @@ void ecuPrintPartNumber (uint8_t ecuId)
 void progModeOn (void)
 {
   uint8_t  data[CAN_MSG_SIZE] = { 0xFF, 0x86, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
-  uint32_t time = 5000;
+  uint32_t time = 3000;
   uint32_t delayTime = 5;
   bool     verbose = true;
 
@@ -777,6 +786,16 @@ void crackPinPosition (uint8_t *pin, uint32_t pos, bool verbose)
   /* clear collected latencies */
 
   memset (sequence, 0, sizeof(sequence));
+
+  /* print the latency histogram titles */
+  printf("                       ");
+  for (k = 0; k < CEM_REPLY_US; k++) {
+    if ((k >= averageReponse - HISTOGRAM_DISPLAY_MIN) &&
+        (k <= averageReponse + HISTOGRAM_DISPLAY_MAX)) {
+      printf ("%3u ", k);
+    }
+  }
+  printf("\n");
 
   /* iterate over all possible values for the PIN digit */
 
@@ -861,8 +880,8 @@ void crackPinPosition (uint8_t *pin, uint32_t pos, bool verbose)
     
           /* print the latency histogram for relevant values */
     
-          if ((k >= HISTOGRAM_DISPLAY_MIN) &&
-              (k <= HISTOGRAM_DISPLAY_MAX)) {
+          if ((k >= averageReponse - HISTOGRAM_DISPLAY_MIN) &&
+              (k <= averageReponse + HISTOGRAM_DISPLAY_MAX)) {
             printf ("%03u ", histogram[k]);
           }
     
@@ -1150,19 +1169,21 @@ void mcp2515Init (void)
 {
   printf ("CAN_HS init\n");
 
+  //while(CAN_OK != CAN_HS.begin(CAN_500KBPS)) {
+  //while (MCP2515_OK != CAN_HS.begin (CAN_HS_BAUD)) {
   while (MCP2515_OK != CAN_HS.begin (CAN_HS_BAUD, MCP2515_CLOCK)) {
     delay (1000);
   }
 
   printf ("CAN_HS init done\n");
   
-  pinMode (CAN_INTR_PIN, INPUT);
+  //pinMode (CAN_INTR_PIN, INPUT);
   pinMode (CAN_INTR_PIN, INPUT_PULLUP);
   attachInterrupt (digitalPinToInterrupt (CAN_INTR_PIN), canInterruptHandler, FALLING);
 
 #ifdef HAS_CAN_LS
   printf ("CAN_LS init\n");
-  while (MCP2515_OK != CAN_LS.begin (CAN_LS_BAUD, MCP_8MHz)) {
+  while (MCP2515_OK != CAN_LS.begin (CAN_LS_BAUD, MCP2515_CLOCK)) {
     delay (1000);
   }
   printf ("CAN_LS init done\n");
@@ -1257,16 +1278,16 @@ void __assert__ (const char *__func, const char *__file,
 
 void setup (void)
 {
-  /* set up the serial port */
-
-  Serial.begin (115200);
-  delay (3000);
-
   /* set up the pin for sampling the CAN bus */
 
   pinMode (CAN_L_PIN, INPUT_PULLUP);
   pinMode(PLATFORM_SELECTION_PIN, INPUT_PULLUP);
-  delay(100);
+
+  /* set up the serial port */
+
+  Serial.begin (115200);
+  delay (2000);
+
   if (digitalRead(PLATFORM_SELECTION_PIN) == HIGH)
   {
     platform = PLATFORM_P1;
@@ -1284,10 +1305,10 @@ void setup (void)
       BUCKETS_PER_US        = 1;                    /* how many buckets per microsecond do we store (1 means 1us resolution */
       CEM_REPLY_DELAY_US    = (30*BUCKETS_PER_US);  /* minimum time in us for CEM to reply for PIN unlock command (approx) */
       CEM_REPLY_TIMEOUT_MS  = 2;                    /* maximum time in ms for CEM to reply for PIN unlock command (approx) */
-      HISTOGRAM_DISPLAY_MIN = 80;                   /* minimum count for histogram display */
-      HISTOGRAM_DISPLAY_MAX = 94;                   /* maximum count for histogram display */
+      HISTOGRAM_DISPLAY_MIN = 12;                   /* minimum count for histogram display below average */
+      HISTOGRAM_DISPLAY_MAX = 14;                   /* maximum count for histogram display above average */
 
-      DUMP_BUCKETS          = 0;                    /* dump all buckets for debugging */
+      DUMP_BUCKETS          = 0;                    /* dump all buckets for debugging, used only for P1 */
       USE_ROLLING_AVERAGE   = 0;                    /* use a rolling average latency for choosing measurements */ 
 
 
@@ -1321,11 +1342,11 @@ void setup (void)
       printf("Unknown platform - this should not happen\n");        /* must pick PLATFORM_P1 or PLATFORM_P2 above */
   }
 
-#if defined(TEENSY_MODEL_4X) && defined(PLATFORM_P2)
+#if defined(TEENSY_MODEL_4X) 
 
   /* lowering the Teensy 4.x clock rate provides more consistent results */
-
-  set_arm_clock (180000000);
+  printf("Setting CPU clock to 180MHz\n");
+  //set_arm_clock (180000000);
 #endif
 
   printf ("CPU Maximum Frequency:   %u\n", F_CPU);
@@ -1358,6 +1379,12 @@ void setup (void)
 #endif /* HW_SELECTION */
 
 
+//  CAN_HS.init_Filt(0, 1, 0x000ffffe);
+//  CAN_HS.init_Mask(0, 1, 0xffffffff);
+
+  CAN_HS.init_Filt(0, 1, 0);
+  CAN_HS.init_Mask(0, 1, 0);
+
   printf ("Initialization done.\n\n");
 }
 
@@ -1372,6 +1399,8 @@ void loop (void)
 {
   bool verbose = false;
 
+
+  //while(true) canMsgReceive (NULL, NULL, false, true);
 
   /* drain any pending messages */
 
@@ -1393,11 +1422,13 @@ void loop (void)
 
   /* try and crack the PIN */
 
-  cemCrackPin (CALC_BYTES, verbose);
+  //cemCrackPin (CALC_BYTES, verbose);
 
   /* exit ECU programming mode */
 
   progModeOff ();
+
+  //while(true) canMsgReceive (NULL, NULL, false, true);
 
   /* all done, stop */
 
