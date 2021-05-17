@@ -101,7 +101,7 @@ uint8_t platform = PLATFORM_UNKNOWN;
 volatile uint8_t operatingState = STATE_IDLE;
 
 #define HAS_CAN_LS          /* in the vehicle both low-speed and high-speed CAN-buses need to go into programming mode */
-#define SAMPLES        35   /* number of samples per sequence, more is better (up to 100) (10 samples = ~3 minutes)*/
+#define SAMPLES        25   /* number of samples per sequence, more is better (up to 100) (10 samples = ~3 minutes)*/
 #define CALC_BYTES     3    /* how many PIN bytes to calculate (1 to 4), the rest is brute-forced */
 #define NUM_LOOPS      2000 /* how many loops to do when calculating crack rate */
 
